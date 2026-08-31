@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     redshift_db_user: Optional[str] = None
     redshift_database: str = "dev"
     redshift_schema: str = "credit_risk_prod"
-
+    ml_predict_function: str = "predict_credit_growth"
 
     forecast_table: str = "latest_forecast"
     query_timeout_seconds: float = 30.0
