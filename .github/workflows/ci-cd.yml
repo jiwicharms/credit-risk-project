@@ -1,0 +1,119 @@
+name: credit-risk-api CI/CD
+
+# GitHub only ever looks for workflows in .github/workflows/ at the repo
+# ROOT, never inside a subfolder -- even though everything this workflow
+# touches lives under 04-api/. Every job below either cds into 04-api or
+# sets working-directory explicitly for that reason.
+#
+# paths: only run when the API itself (or this workflow) changes. Editing
+# 01-ingestion or a SQL file in 02-model should not rebuild and redeploy
+# the API.
+on:
+  push:
+    branches: [main]
+    paths: ["04-api/**", ".github/workflows/ci-cd.yml"]
+  pull_request:
+    paths: ["04-api/**", ".github/workflows/ci-cd.yml"]
+
+defaults:
+  run:
+    working-directory: 04-api
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Continuous integration: runs on every push and every PR, main or not.
+  # This is the part that actually earns the word "continuous" -- it is
+  # what catches a broken change before it reaches main, not just after.
+  # ---------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: 04-api/requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Test
+        # No AWS credentials here on purpose. The suite mocks the Redshift
+        # client at the boundary (see tests/test_api.py) and specifically
+        # asserts the two Redshift ML requirements this project spent real
+        # time discovering -- the schema-qualified call and the mandatory
+        # FROM clause -- directly against the generated SQL string. A green
+        # run here proves the code is correct without needing the warehouse
+        # to be reachable from a GitHub-hosted runner.
+        env:
+          REDSHIFT_WORKGROUP: ci-placeholder
+          REDSHIFT_SCHEMA: credit_risk_prod
+          AWS_REGION: us-east-1
+        run: python -m pytest tests/ -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the container image
+        run: docker build -t credit-risk-api .
+
+      - name: Confirm it starts and serves /health
+        # Real container, real network request -- not an import check.
+        # Redshift is unreachable in this environment on purpose (no
+        # REDSHIFT_WORKGROUP set), which is exactly what confirms /health
+        # never touches the warehouse: a paused Serverless workgroup must
+        # never make Elastic Beanstalk's load balancer kill a container
+        # that is otherwise fine.
+        run: |
+          docker run -d --name api -p 8000:8000 credit-risk-api
+          for i in $(seq 1 20); do
+            curl -fsS localhost:8000/health && break || sleep 2
+          done
+          curl -fsS localhost:8000/health | grep -q '"ok"'
+          docker rm -f api
+
+  # ---------------------------------------------------------------------
+  # Continuous deployment: only after both jobs above pass, and only for
+  # an actual push to main -- a pull request never deploys, no matter how
+  # green its checks are.
+  # ---------------------------------------------------------------------
+  deploy:
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install the EB CLI
+        run: pip install awsebcli
+
+      - name: Deploy
+        # No app/environment name is hardcoded anywhere in this workflow.
+        # eb deploy reads its target from .elasticbeanstalk/config.yml,
+        # which must be committed to the repo -- see infra/README.md for
+        # why that file is safe to commit (it holds no credentials) and
+        # what to check if this step deploys to the wrong environment.
+        run: eb deploy --timeout 20
+
+      - name: Smoke-test the live deployment
+        # The deploy step succeeding only means Elastic Beanstalk accepted
+        # the new version -- it says nothing about whether the container
+        # actually came up healthy. This is the check that closes that gap.
+        run: |
+          curl -fsS "${{ vars.EB_URL }}/health" | grep -q '"ok"'
+          curl -fsS "${{ vars.EB_URL }}/forecast/latest" | grep -q predicted_pct_change
