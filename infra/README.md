@@ -62,7 +62,7 @@ hardcoded anywhere -- it reads both from this file, the same way your local
 deploy to and fails immediately with a clear error, not a wrong deploy.
 
 ```bash
-cd 04-api
+cd 03-api
 git check-ignore -v .elasticbeanstalk/config.yml
 ```
 

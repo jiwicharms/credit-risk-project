@@ -2,7 +2,7 @@ name: credit-risk-api CI/CD
 
 # GitHub only ever looks for workflows in .github/workflows/ at the repo
 # ROOT, never inside a subfolder -- even though everything this workflow
-# touches lives under 04-api/. Every job below either cds into 04-api or
+# touches lives under 03-api/. Every job below either cds into 03-api or
 # sets working-directory explicitly for that reason.
 #
 # paths: only run when the API itself (or this workflow) changes. Editing
@@ -11,13 +11,13 @@ name: credit-risk-api CI/CD
 on:
   push:
     branches: [main]
-    paths: ["04-api/**", ".github/workflows/ci-cd.yml"]
+    paths: ["03-api/**", ".github/workflows/ci-cd.yml"]
   pull_request:
-    paths: ["04-api/**", ".github/workflows/ci-cd.yml"]
+    paths: ["03-api/**", ".github/workflows/ci-cd.yml"]
 
 defaults:
   run:
-    working-directory: 04-api
+    working-directory: 03-api
 
 jobs:
   # ---------------------------------------------------------------------
@@ -34,7 +34,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: 04-api/requirements*.txt
+          cache-dependency-path: 03-api/requirements*.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
