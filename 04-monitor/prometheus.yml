@@ -1,0 +1,29 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # Scrapes the deployed Elastic Beanstalk environment directly over the
+  # public internet -- /metrics is a normal HTTP endpoint, same as /health.
+  # No VPC access, no tunnel, nothing else to wire up. Replace the target
+  # if the CNAME changes (a new `eb create` gets a new one).
+  - job_name: credit-risk-api-prod
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ['credit-risk-prod.eba-mymkedgx.us-east-1.elasticbeanstalk.com:80']
+        labels:
+          env: prod
+
+  # Optional: a container run locally with `docker run -p 8000:8000 ...`.
+  # Uncomment to compare local behavior against the deployed environment
+  # side by side in the same dashboard.
+  # - job_name: credit-risk-api-local
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets: ['host.docker.internal:8000']
+  #       labels:
+  #         env: local

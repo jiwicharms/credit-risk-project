@@ -1,0 +1,557 @@
+"""
+ingest_fred.py
+
+Ingests macroeconomic and consumer credit series from FRED into AWS.
+
+    FRED API  ->  local CSV  ->  S3 (raw landing)  ->  Redshift (COPY)
+
+Usage:
+    export FRED_API_KEY="..."          # free: fredaccount.stlouisfed.org/apikeys
+    export S3_BUCKET="..."
+    export REDSHIFT_WORKGROUP="credit-risk-wg"
+    export REDSHIFT_DATABASE="dev"
+    export REDSHIFT_SCHEMA="credit_risk_prod"
+
+    python src/ingest_fred.py --local-only    # fetch + transform, no AWS, no cost
+    python src/ingest_fred.py                 # full pipeline
+    python src/ingest_fred.py --skip-fetch    # reload existing CSV to AWS
+    python src/ingest_fred.py --local-only --ml-ready   # also write SageMaker CSVs
+
+Changes from the previous revision, all documented at their call sites:
+  * gdp_growth is compounded, matching BEA's published annualization
+  * REVOLSL's pre-1977 definitional breaks are truncated by default
+  * the credit-card series' pre-1991 nulls are an explicit policy, not a leak
+  * validate() checks every shipped column and its threshold matches its message
+  * --ml-ready emits numeric, dateless, complete-case CSVs with a growth target
+"""
+
+import argparse
+import logging
+import os
+import sys
+import time
+from functools import reduce
+
+import pandas as pd
+import requests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("ingest_fred")
+
+FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+
+# FRED series id -> warehouse column name.
+SERIES = {
+    "UNRATE": "unemployment_rate",
+    "GDPC1": "real_gdp",
+    "FEDFUNDS": "fed_funds_rate",
+    "CPIAUCSL": "cpi",
+    "UMCSENT": "consumer_sentiment",
+    "USREC": "recession_flag",
+    "REVOLSL": "revolving_credit",
+    "DRCCLACBS": "cc_delinquency_rate",
+    "CORCCACBS": "cc_chargeoff_rate",
+}
+
+# Series published quarterly. Forward-filled to the monthly grain, but any
+# derived rate must be computed BEFORE the fill — see build_dataset().
+# consumer_sentiment is monthly from 1978 onward but quarterly before that,
+# so it needs the same treatment for the early years.
+QUARTERLY = {"real_gdp", "cc_delinquency_rate", "cc_chargeoff_rate",
+             "consumer_sentiment"}
+
+# The credit-card series do not exist before 1991Q1 (DRCCLACBS) and 1985Q1
+# (CORCCACBS). Forward-fill cannot invent history backwards, so every row
+# before 1991 carries nulls in these two columns. That is a real property of
+# the data, not a bug — but it has to be a decision, not an accident. See
+# CREDIT_CARD_POLICY below.
+CREDIT_CARD_COLS = ["cc_delinquency_rate", "cc_chargeoff_rate"]
+
+FETCH_START = "1960-01-01"
+
+# REVOLSL carries three definitional breaks — Jan 1971, Oct 1976 and Jan 1977 —
+# where the Fed changed what counts as revolving credit. They appear in the
+# month-over-month change as large jumps that are accounting artifacts, not
+# consumer behavior. Cutting the series at 1977-02-01 dropped the standard
+# deviation of the target from 3.83 to 0.89: roughly three quarters of the
+# apparent volatility in the full history is definitional noise.
+#
+# Set --start 1968-01-01 to keep the full series, but do not model on it
+# without saying what those jumps are.
+REVOLSL_BREAKS = ["1971-01-01", "1976-10-01", "1977-01-01"]
+TRAINING_START = "1977-02-01"
+
+LOCAL_CSV = "data/processed/macro_credit_conditions.csv"
+S3_KEY = "fred/macro_credit_conditions.csv"
+TABLE = "macro_conditions"
+
+COLUMNS = [
+    "date", "unemployment_rate", "real_gdp", "gdp_growth", "fed_funds_rate",
+    "cpi", "cpi_yoy", "consumer_sentiment", "recession_flag",
+    "revolving_credit", "cc_delinquency_rate", "cc_chargeoff_rate",
+]
+
+
+# ============================================================ fetch
+
+def fetch_series(series_id: str, api_key: str, start: str = FETCH_START,
+                 vintage: str = "", retries: int = 3) -> pd.DataFrame:
+    """Fetch one FRED series as a two-column DataFrame (date, <column>).
+
+    `vintage` pins the request to how the series looked on a given date. FRED
+    revises continuously — REVOLSL is restated most months and GDP for years —
+    so without it, rerunning this script next quarter produces a different
+    dataset from identical code.
+    """
+    col = SERIES[series_id]
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": start,
+    }
+    if vintage:
+        params["realtime_start"] = vintage
+        params["realtime_end"] = vintage
+
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(FRED_BASE_URL, params=params, timeout=30)
+            resp.raise_for_status()
+            break
+        except requests.RequestException as e:
+            if attempt == retries:
+                raise
+            wait = 2 ** attempt
+            log.warning("  %s failed (%s), retrying in %ds", series_id, e, wait)
+            time.sleep(wait)
+
+    obs = resp.json().get("observations", [])
+    if not obs:
+        raise ValueError(f"{series_id} returned no observations")
+
+    df = pd.DataFrame(obs)[["date", "value"]]
+    # FRED encodes a missing value as a literal "." string. astype(float)
+    # raises ValueError on it, which would abort the run partway through;
+    # to_numeric(errors="coerce") turns it into NaN so the dropna below can
+    # remove it cleanly and the log can report how many were skipped.
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"])
+    before = len(df)
+    df = df.rename(columns={"value": col}).dropna(subset=[col])
+
+    skipped = before - len(df)
+    log.info("  %-10s %-22s %5d obs  (%s to %s)%s", series_id, col, len(df),
+             df["date"].min().date(), df["date"].max().date(),
+             f"  [{skipped} missing]" if skipped else "")
+    return df
+
+
+# ============================================================ transform
+
+def build_dataset(frames: dict, start: str = TRAINING_START,
+                  credit_card_policy: str = "include") -> pd.DataFrame:
+    """Merge series onto a monthly grain and derive the computed columns."""
+
+    # 1. Derive GDP growth on the QUARTERLY grain, before any forward fill.
+    #    Computing it after the fill produces two months of 0% growth followed
+    #    by one month of a full quarter's change — a sawtooth that is purely an
+    #    artifact of the fill. This was a real bug caught by regression test.
+    #
+    #    Annualization compounds rather than multiplying by four. BEA publishes
+    #    ((q_t/q_{t-1})^4 - 1) * 100, and the two diverge exactly where it
+    #    matters most: at -2.0% quarterly the simple form reads -8.00% against
+    #    a true -7.76%, a 0.24pp error concentrated in recessions — the regime
+    #    RQ2 is about.
+    gdp = frames["real_gdp"].sort_values("date").copy()
+    gdp["gdp_growth"] = ((1.0 + gdp["real_gdp"].pct_change()) ** 4 - 1.0) * 100.0
+    frames["real_gdp"] = gdp
+
+    merged = reduce(
+        lambda a, b: pd.merge(a, b, on="date", how="outer"),
+        [f.sort_values("date") for f in frames.values()],
+    ).sort_values("date").reset_index(drop=True)
+
+    # 2. Resample onto a complete monthly index. FRED quarterly series are
+    #    stamped on the first month of the quarter, so they land cleanly.
+    merged = merged.set_index("date").resample("MS").first()
+
+    # 3. Forward-fill quarterly series across the intervening months.
+    for col in QUARTERLY | {"gdp_growth"}:
+        if col in merged.columns:
+            merged[col] = merged[col].ffill()
+
+    # 4. CPI year-over-year, computed on the monthly grain where it belongs.
+    merged["cpi_yoy"] = merged["cpi"].pct_change(periods=12) * 100.0
+
+    merged = merged.reset_index()
+
+    # 5. The target series starts in 1968 and cpi_yoy needs 12 months of
+    #    history. Drop rows before both are available rather than shipping
+    #    nulls into the warehouse.
+    required = ["revolving_credit", "cpi_yoy", "unemployment_rate",
+                "consumer_sentiment", "gdp_growth", "fed_funds_rate"]
+    merged = merged.dropna(subset=required)
+
+    # 6. Recession flag is an indicator, not a level — forward-filling it would
+    #    invent recessions. It is monthly already, so just coerce the type.
+    merged["recession_flag"] = merged["recession_flag"].fillna(0).astype(int)
+
+    # 6b. Truncate at the first break in the monthly sequence.
+    #     The Oct 2025 federal shutdown suspended BLS collection, so UNRATE
+    #     and CPIAUCSL have no value that month while the Fed and Michigan
+    #     series published normally. Step 5 above drops that row for being
+    #     incomplete, which leaves a hole in the date sequence — and a hole
+    #     silently corrupts the LAG() building the target in Stage 4, giving
+    #     a "month-over-month" change that actually spans two months with
+    #     nothing downstream flagging it. Cutting at the last contiguous
+    #     month is the honest fix: interpolating would put an invented
+    #     unemployment rate into a warehouse of record.
+    gaps = merged["date"].diff().dt.days
+    if (gaps > 40).any():
+        first_hole = merged.loc[gaps > 40, "date"].min()
+        before = len(merged)
+        merged = merged[merged["date"] < first_hole]
+        log.warning("Truncating at %s — %d rows dropped after a break in the "
+                    "monthly sequence (%s missing). Publication gap, not a "
+                    "pipeline error.",
+                    merged["date"].max().date(), before - len(merged),
+                    first_hole.date())
+
+    # 6c. Cut the pre-1977 definitional breaks in REVOLSL. See REVOLSL_BREAKS.
+    #     Without this the target carries three accounting jumps that dominate
+    #     its variance and that no feature can predict, because nothing in the
+    #     macro data caused them.
+    if start:
+        cutoff = pd.Timestamp(start)
+        kept = merged["date"] >= cutoff
+        if not kept.all():
+            broken = [b for b in REVOLSL_BREAKS if pd.Timestamp(b) < cutoff]
+            log.info("Starting at %s — %d earlier rows dropped, covering %d "
+                     "REVOLSL definitional break(s). Pass --start 1968-01-01 "
+                     "to keep them.", start, (~kept).sum(), len(broken))
+            merged = merged[kept]
+
+    # 6d. Credit-card series policy. These are null before 1991 and cannot be
+    #     filled backwards. Three defensible choices, none of them silent:
+    #
+    #       include  ship the nulls. Redshift stores them as NULL, which is
+    #                honest for a warehouse of record — but SageMaker's CSV
+    #                readers see trailing empty fields ",," and fail to parse,
+    #                and Autopilot will drop those rows without telling you.
+    #       exclude  drop both columns, keeping the full row history.
+    #       complete restrict to 1991-01 onward, keeping both columns.
+    n_null = merged[CREDIT_CARD_COLS].isna().any(axis=1).sum()
+    if n_null:
+        first_complete = merged.loc[
+            merged[CREDIT_CARD_COLS].notna().all(axis=1), "date"].min()
+        if credit_card_policy == "exclude":
+            merged = merged.drop(columns=CREDIT_CARD_COLS)
+            log.info("Dropped %s — null in %d of %d rows before %s.",
+                     ", ".join(CREDIT_CARD_COLS), n_null, len(merged),
+                     first_complete.date())
+        elif credit_card_policy == "complete":
+            merged = merged[merged["date"] >= first_complete]
+            log.info("Restricted to %s onward — %d rows dropped so %s are "
+                     "complete.", first_complete.date(), n_null,
+                     " and ".join(CREDIT_CARD_COLS))
+        else:
+            log.warning(
+                "%d of %d rows have null %s (before %s). Kept, and they will "
+                "load as NULL. Exclude them from CREATE MODEL or use "
+                "--credit-card complete before training.",
+                n_null, len(merged), "/".join(CREDIT_CARD_COLS),
+                first_complete.date())
+
+    merged["date"] = merged["date"].dt.strftime("%Y-%m-%d")
+    columns = [c for c in COLUMNS if c in merged.columns]
+    out = merged[columns].copy()
+
+    log.info("Built dataset: %d rows x %d cols (%s to %s)",
+             len(out), len(out.columns), out["date"].iloc[0], out["date"].iloc[-1])
+    return out
+
+
+def validate(df: pd.DataFrame) -> None:
+    """Fail loudly before anything reaches AWS."""
+    problems = []
+
+    # 1977-02 through the present is roughly 580 months; a 1968 start is ~690.
+    # The floor is deliberately just under the smaller of the two so it catches
+    # a genuinely truncated build rather than a legitimate --start choice.
+    minimum = 550
+    if len(df) < minimum:
+        problems.append(f"only {len(df)} rows — expected at least {minimum}")
+    if df["date"].duplicated().any():
+        problems.append("duplicate dates")
+    if not df["recession_flag"].isin([0, 1]).all():
+        problems.append("recession_flag outside {0,1}")
+    if (df["revolving_credit"] <= 0).any():
+        problems.append("non-positive revolving_credit")
+    if df["unemployment_rate"].max() > 30 or df["unemployment_rate"].min() < 0:
+        problems.append("unemployment_rate out of plausible range")
+
+    gaps = pd.to_datetime(df["date"]).diff().dt.days.dropna()
+    if (gaps > 40).any():
+        problems.append(f"{(gaps > 40).sum()} gaps larger than one month")
+
+    # gdp_growth constant across three-month runs is expected (forward fill).
+    # gdp_growth constant across the WHOLE series means the fill ran before the
+    # derivation and every value is the same artifact.
+    if df["gdp_growth"].nunique() < 4:
+        problems.append("gdp_growth is nearly constant — derived after the fill?")
+
+    # Every column that is shipped gets a null check, not just the six model
+    # features. The credit-card columns are allowed nulls only before 1991,
+    # and only because build_dataset() logged that decision.
+    always_complete = [c for c in df.columns if c not in CREDIT_CARD_COLS]
+    nulls = df[always_complete].isna().sum()
+    if nulls.any():
+        problems.append(f"nulls in required columns: {nulls[nulls > 0].to_dict()}")
+
+    for col in CREDIT_CARD_COLS:
+        if col in df.columns and df[col].isna().any():
+            span = df.loc[df[col].isna(), "date"]
+            log.info("NOTE: %s null for %d rows (%s to %s) — expected, the "
+                     "series does not exist before 1991.",
+                     col, df[col].isna().sum(), span.min(), span.max())
+
+    if problems:
+        for p in problems:
+            log.error("VALIDATION: %s", p)
+        raise ValueError("dataset failed validation — not uploading")
+
+    log.info("Validation passed: %d rows, no gaps, ranges plausible", len(df))
+
+
+# ============================================================ ml-ready export
+
+def write_ml_ready(df: pd.DataFrame, out_dir: str, test_fraction: float = 0.2,
+                   headerless: bool = True) -> None:
+    """Write SageMaker-ready train/test CSVs.
+
+    Four things here exist because each one previously broke a training job:
+
+      1. The target is next month's percentage change, not the level. Revolving
+         credit rose from ~$1.3B in 1968 to ~$1.31T today, so a chronological
+         split leaves the test period entirely outside the training range.
+         Neighbor and tree models cannot extrapolate past what they saw, and
+         their predictions flatten at the training maximum. A growth target is
+         stationary and does not have this problem.
+
+      2. The target LEADS. Row t pairs month t's conditions with the change
+         observed into t+1, which is what "next month" in the research question
+         means. A lag would describe the present instead, and every metric
+         would still look fine.
+
+      3. The date column is dropped. SageMaker's built-in CSV readers parse
+         every field as numeric and fail on "1/1/68".
+
+      4. Only complete rows survive. Trailing empty fields from the pre-1991
+         credit-card nulls produce ",," at the end of a line, which the CSV
+         reader rejects before training starts.
+
+    Target is written to column 0, headerless by default, as the built-in
+    algorithms expect.
+    """
+    frame = df.copy()
+
+    frame["pct_change_next_month"] = (
+        frame["revolving_credit"].shift(-1) / frame["revolving_credit"] - 1.0
+    ) * 100.0
+
+    before = len(frame)
+    frame = frame.drop(columns=["date"]).dropna()
+    if before - len(frame):
+        log.info("  dropped %d incomplete rows (pre-1991 credit-card nulls and "
+                 "the final month, which has no t+1)", before - len(frame))
+
+    features = [c for c in frame.columns if c != "pct_change_next_month"]
+    frame = frame[["pct_change_next_month"] + features]
+
+    split = int(len(frame) * (1.0 - test_fraction))
+    train, test = frame.iloc[:split], frame.iloc[split:]
+
+    os.makedirs(out_dir, exist_ok=True)
+    kwargs = {"index": False, "header": not headerless}
+    train.to_csv(os.path.join(out_dir, "train.csv"), **kwargs)
+    test.to_csv(os.path.join(out_dir, "test.csv"), **kwargs)
+
+    log.info("  train %d rows, test %d rows, feature_dim=%d",
+             len(train), len(test), len(features))
+    log.info("  wrote %s/train.csv and test.csv (target in column 0, %s)",
+             out_dir, "no header" if headerless else "with header")
+
+    # The extrapolation trap, checked rather than assumed.
+    tr, te = train["pct_change_next_month"], test["pct_change_next_month"]
+    if te.min() < tr.min() or te.max() > tr.max():
+        log.warning("  test target range [%.2f, %.2f] extends beyond train "
+                    "[%.2f, %.2f] — extrapolation needed at the tails",
+                    te.min(), te.max(), tr.min(), tr.max())
+    else:
+        log.info("  test target range sits inside train range — no "
+                 "extrapolation required")
+
+    train_rec = int(train.get("recession_flag", pd.Series(dtype=int)).sum())
+    test_rec = int(test.get("recession_flag", pd.Series(dtype=int)).sum())
+    log.info("  recession months: %d train, %d test", train_rec, test_rec)
+    if test_rec < 5:
+        log.warning("  only %d recession months in test — RQ2's regime "
+                    "comparison rests on a very small sample there", test_rec)
+
+
+# ============================================================ load
+
+def upload_to_s3(path: str, bucket: str, key: str) -> str:
+    import boto3
+    s3 = boto3.client("s3")
+    s3.upload_file(path, bucket, key, ExtraArgs={"ServerSideEncryption": "AES256"})
+    uri = f"s3://{bucket}/{key}"
+    log.info("Uploaded %s", uri)
+    return uri
+
+
+def copy_to_redshift(s3_uri: str, workgroup: str, database: str,
+                     schema: str, iam_role: str) -> None:
+    import boto3
+    rs = boto3.client("redshift-data")
+
+    # TRUNCATE then COPY makes the pipeline idempotent: rerunning replaces the
+    # table rather than appending duplicates. Redshift won't enforce a primary
+    # key, so this is the only thing standing between you and a doubled table.
+    # TRUNCATE rather than DROP also preserves the GRANTs the API role depends
+    # on — a dropped table takes its grants with it, and the resulting 503
+    # reads exactly like an IAM failure.
+    statements = [
+        f"TRUNCATE TABLE {schema}.{TABLE};",
+        f"""COPY {schema}.{TABLE}
+            FROM '{s3_uri}'
+            IAM_ROLE '{iam_role}'
+            CSV IGNOREHEADER 1
+            DATEFORMAT 'YYYY-MM-DD'
+            BLANKSASNULL EMPTYASNULL
+            REGION '{os.getenv("AWS_REGION", "us-east-1")}';""",
+    ]
+
+    for sql in statements:
+        label = sql.strip().split()[0]
+        sid = rs.execute_statement(
+            WorkgroupName=workgroup, Database=database, Sql=sql
+        )["Id"]
+
+        while True:
+            desc = rs.describe_statement(Id=sid)
+            if desc["Status"] == "FINISHED":
+                break
+            if desc["Status"] in ("FAILED", "ABORTED"):
+                log.error("%s failed: %s", label, desc.get("Error"))
+                # STL_LOAD_ERRORS holds the per-row detail COPY won't return
+                # through the Data API. Almost every COPY failure is explained
+                # there and nowhere else.
+                log.error("Run in Query Editor v2 for detail:")
+                log.error("  SELECT * FROM sys_load_error_detail "
+                          "ORDER BY start_time DESC LIMIT 5;")
+                raise RuntimeError(f"{label} failed")
+            time.sleep(0.5)
+        log.info("%s ok", label)
+
+    sid = rs.execute_statement(
+        WorkgroupName=workgroup, Database=database,
+        Sql=f"SELECT COUNT(*), MIN(date), MAX(date) FROM {schema}.{TABLE};",
+    )["Id"]
+    while rs.describe_statement(Id=sid)["Status"] not in ("FINISHED", "FAILED", "ABORTED"):
+        time.sleep(0.3)
+    rec = rs.get_statement_result(Id=sid)["Records"][0]
+    log.info("Loaded: %s rows, %s to %s",
+             rec[0]["longValue"], rec[1]["stringValue"], rec[2]["stringValue"])
+
+
+# ============================================================ main
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Ingest FRED series into Redshift")
+    ap.add_argument("--local-only", action="store_true",
+                    help="fetch and transform only; touch no AWS resource")
+    ap.add_argument("--skip-fetch", action="store_true",
+                    help="reuse the existing CSV instead of calling FRED")
+    ap.add_argument("--csv", default=LOCAL_CSV)
+    ap.add_argument("--start", default=TRAINING_START,
+                    help="first month to keep. Default cuts REVOLSL's pre-1977 "
+                         "definitional breaks; pass 1968-01-01 for full history.")
+    ap.add_argument("--credit-card", choices=["include", "exclude", "complete"],
+                    default="include",
+                    help="how to handle cc_* nulls before 1991")
+    ap.add_argument("--vintage", default=os.getenv("FRED_VINTAGE", ""),
+                    help="pin FRED to a YYYY-MM-DD vintage for reproducibility")
+    ap.add_argument("--ml-ready", action="store_true",
+                    help="also write SageMaker train/test CSVs")
+    ap.add_argument("--ml-dir", default="data/ml")
+    args = ap.parse_args()
+
+    if args.skip_fetch:
+        if not os.path.exists(args.csv):
+            log.error("%s not found", args.csv)
+            return 1
+        df = pd.read_csv(args.csv)
+        log.info("Loaded %d rows from %s", len(df), args.csv)
+    else:
+        api_key = os.getenv("FRED_API_KEY")
+        if not api_key:
+            log.error("FRED_API_KEY not set. Free key: "
+                      "https://fredaccount.stlouisfed.org/apikeys")
+            return 1
+
+        if args.vintage:
+            log.info("Fetching %d series from FRED, pinned to the %s vintage...",
+                     len(SERIES), args.vintage)
+        else:
+            log.info("Fetching %d series from FRED (latest revision — set "
+                     "FRED_VINTAGE to make this reproducible)...", len(SERIES))
+
+        frames = {}
+        for sid in SERIES:
+            frames[SERIES[sid]] = fetch_series(sid, api_key, vintage=args.vintage)
+            time.sleep(0.15)  # courtesy pacing; FRED allows 120 req/min
+
+        df = build_dataset(frames, start=args.start,
+                           credit_card_policy=args.credit_card)
+        os.makedirs(os.path.dirname(args.csv), exist_ok=True)
+        df.to_csv(args.csv, index=False)
+        log.info("Wrote %s", args.csv)
+
+    validate(df)
+
+    if args.ml_ready:
+        log.info("Writing SageMaker-ready splits...")
+        write_ml_ready(df, args.ml_dir)
+
+    if args.local_only:
+        log.info("--local-only: stopping before AWS")
+        print()
+        print(df.head(3).to_string(index=False))
+        print("...")
+        print(df.tail(3).to_string(index=False))
+        return 0
+
+    bucket = os.getenv("S3_BUCKET")
+    workgroup = os.getenv("REDSHIFT_WORKGROUP", "credit-risk-wg")
+    database = os.getenv("REDSHIFT_DATABASE", "dev")
+    schema = os.getenv("REDSHIFT_SCHEMA", "credit_risk_prod")
+    iam_role = os.getenv("REDSHIFT_IAM_ROLE", "default")
+
+    if not bucket:
+        log.error("S3_BUCKET not set")
+        return 1
+
+    uri = upload_to_s3(args.csv, bucket, S3_KEY)
+    copy_to_redshift(uri, workgroup, database, schema, iam_role)
+    log.info("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

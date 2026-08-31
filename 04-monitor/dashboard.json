@@ -1,0 +1,151 @@
+{
+  "title": "Credit risk API (prod)",
+  "uid": "credit-risk-api",
+  "tags": ["msds434", "credit-risk"],
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-3h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Up",
+      "description": "1 if Prometheus successfully scraped the deployed environment on the last attempt.",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [{ "refId": "A", "expr": "up{job=\"credit-risk-api-prod\"}" }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "5xx rate",
+      "gridPos": { "h": 5, "w": 5, "x": 4, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 0.01 },
+              { "color": "red", "value": 0.05 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(http_requests_total{status=\"5xx\"}[5m])) / clamp_min(sum(rate(http_requests_total[5m])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Forecast cache hit rate",
+      "description": "1 minus (Redshift calls / /forecast/latest requests) over 15m. Close to 1 means the cache is doing its job.",
+      "gridPos": { "h": 5, "w": 5, "x": 9, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - (sum(rate(redshift_query_seconds_count{endpoint=\"forecast\"}[15m])) / clamp_min(sum(rate(http_requests_total{handler=\"/forecast/latest\"}[15m])), 0.0001))"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Request rate by endpoint",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(http_requests_total[5m])) by (handler)",
+          "legendFormat": "{{handler}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "HTTP latency p50 / p95 / p99",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Redshift round-trip latency by endpoint",
+      "description": "predict runs live inference every call; forecast is cached, so its calls should be far less frequent (see the cache hit rate panel) even though individual call latency is similar.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 13 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(redshift_query_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p95 — {{endpoint}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum(rate(redshift_query_seconds_bucket[5m])) by (le, endpoint))",
+          "legendFormat": "p50 — {{endpoint}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Redshift call volume by endpoint",
+      "description": "How many actual Redshift queries each endpoint is generating -- the number the cache hit rate panel above is derived from.",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(redshift_query_seconds_count[5m])) by (endpoint)",
+          "legendFormat": "{{endpoint}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

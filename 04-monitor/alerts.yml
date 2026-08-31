@@ -1,0 +1,49 @@
+groups:
+  - name: credit-risk-api
+    rules:
+      # The warehouse is the dependency most likely to fail -- a paused
+      # Serverless workgroup, a throttled Data API call, a permission that
+      # got reverted. redshift_query_seconds is defined in app/main.py with
+      # one label, endpoint, set to "predict" or "forecast" at the two call
+      # sites -- confirmed against the running app, not assumed.
+      - alert: RedshiftInferenceSlow
+        expr: histogram_quantile(0.95, sum(rate(redshift_query_seconds_bucket[5m])) by (le, endpoint)) > 5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Redshift p95 above 5s for {{ $labels.endpoint }}"
+          description: "Warehouse round trips are slow, or the Serverless workgroup is cold."
+
+      # prometheus-fastapi-instrumentator buckets status into "2xx"/"4xx"/
+      # "5xx" strings, not raw codes -- confirmed by inspecting a live
+      # /metrics response. A regex like status=~"5.." will silently match
+      # nothing against this exporter.
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status="5xx"}[5m]))
+            / clamp_min(sum(rate(http_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "Over 5% of requests are failing"
+
+      - alert: ServiceDown
+        expr: up{job="credit-risk-api-prod"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Prometheus cannot scrape the deployed API"
+          description: "Check eb health and eb logs -- this fires on network failure too, not only application crashes."
+
+      # A cache that stops working costs real Redshift compute on every
+      # request instead of one call per 15 minutes. Compares Redshift calls
+      # against actual /forecast/latest traffic; a ratio near 1 means the
+      # cache is not doing its job.
+      - alert: ForecastCacheNotWorking
+        expr: |
+          (sum(rate(redshift_query_seconds_count{endpoint="forecast"}[15m]))
+            / clamp_min(sum(rate(http_requests_total{handler="/forecast/latest"}[15m])), 0.001)) > 0.5
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Forecast cache appears to be missing on most requests"

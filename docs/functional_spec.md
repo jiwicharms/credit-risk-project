@@ -3,7 +3,6 @@
 **Author**: Jihwan Park
 **Course/Project**: MSDS434 - Credit Risk Predictor
 **Platform**: Amazon Web Services (AWS)
-**Version**: 1.0
 
 ---
 
@@ -32,10 +31,10 @@ Which conditions are the greatest predictors and does it differ during expansion
 - Data ingestion of U.S. macroeconomic time series from FRED
 - Storage of raw data in Amazon S3 and structured data in Amazon RedShift
 - Training of models using RedShift ML
-- 
+- Using a REST API to accept a JSON to return a prediction via JSON
+- Monitoring, dashboards, and alerting via Amazon CloudWatch
 
 ## 3. Data
-
 
 ### 3.1 Source
 
@@ -43,11 +42,29 @@ Federal Reserve Economic Data (FRED), from Federal Reserve Bank of St. Louis.
 Public API, requires free registration.
 
 ### 3.2 Series
+| Table |
+macro_conditions
+
+| Field | Type |
+| date | date
+| unemployment_rate | double precision
+| real_gdp | double precision
+| gdp_growth | double precision
+| fed_funds_rate | double precision
+| cpi | double precision
+| cpi_yoy | double precision
+| consumer_sentiment | double precision
+| recession_flag | smallint
+| revolving_credit | double precision
+| cc_deliquency_rate | double precision
+| cc_chargeoff_rate | double precision
 
 ## 4. Model
 
 ### 4.1 Amazon RedShiftML
-*TBD
+Opting to use `AUTO OFF`, which means the model tuning will be done by hand.
+This is to control hyper-parameters and create reproducability.
+Costs using a 'manual' approach are far cheaper than using SageMaker Autopilot
 
 ## 5. PaaS vs IaaS
 

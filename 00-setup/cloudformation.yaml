@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Credit risk analytics — every AWS resource the pipeline needs, in one stack.
+  Creates an S3 bucket, the IAM role Redshift assumes, and a Redshift Serverless
+  namespace and workgroup.
+
+  Deployed by 00-setup/provision.sh, which discovers your default VPC subnets
+  and generates the admin password. Removed by 00-setup/teardown.sh.
+
+  COST: Redshift Serverless bills per RPU-hour while a query runs, minimum
+  8 RPUs with a 60-second minimum charge. An idle workgroup costs nothing;
+  a forgotten one after a heavy session is how this produces a surprise bill.
+  New accounts normally carry a $300 Redshift Serverless credit.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: credit-risk
+    AllowedPattern: "[a-z0-9-]+"
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Three or more subnets in distinct AZs. provision.sh fills these in.
+
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: >
+      Effectively unused — every component authenticates with IAM — but a
+      Redshift namespace requires one.
+
+  RedshiftRoleName:
+    Type: String
+    Default: RedshiftCreditRiskRole
+
+  BaseCapacity:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    Description: RPUs. 8 is the minimum and ample for ~600 rows of monthly data.
+
+Resources:
+
+  # Name is account- and region-scoped so it is globally unique without anyone
+  # having to invent one, and two people can run this repo side by side.
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # The trust policy is the single most common failure in this stack. Without
+  # redshift.amazonaws.com here, COPY cannot assume the role and CREATE MODEL
+  # never starts — and the error reads like a permissions problem on the
+  # bucket rather than on the role. sagemaker.amazonaws.com is required
+  # because Redshift ML passes this same role through to Autopilot.
+  RedshiftRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RedshiftRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - redshift.amazonaws.com
+                - redshift-serverless.amazonaws.com
+                - sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${DataBucket.Arn}/*"
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt DataBucket.Arn
+        - PolicyName: RedshiftML
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateAutoMLJob
+                  - sagemaker:DescribeAutoMLJob
+                  - sagemaker:ListCandidatesForAutoMLJob
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:CreateProcessingJob
+                  - sagemaker:DescribeProcessingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:CreateTransformJob
+                  - sagemaker:DescribeTransformJob
+                  - sagemaker:AddTags
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream,
+                         logs:PutLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/sagemaker/*"
+
+  # A role cannot reference its own ARN inside an inline policy at create time,
+  # so PassRole has to be attached separately.
+  RedshiftPassRole:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: PassRoleToSageMaker
+      Roles: [!Ref RedshiftRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt RedshiftRole.Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: sagemaker.amazonaws.com
+
+  # Attach to whatever runs the API (the Elastic Beanstalk instance role).
+  # IAM permission is necessary but not sufficient — the GRANT statements in
+  # 00-setup/sql/01_schema.sql are a separate layer, and a missing grant
+  # produces a 503 that reads exactly like an IAM failure.
+  ApiAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-api-access"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            # redshift-data actions do not support resource-level permissions.
+            Action:
+              - redshift-data:ExecuteStatement
+              - redshift-data:DescribeStatement
+              - redshift-data:GetStatementResult
+              - redshift-data:CancelStatement
+              - redshift-data:ListStatements
+            Resource: "*"
+          - Effect: Allow
+            Action: redshift-serverless:GetCredentials
+            Resource: !Sub "arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*"
+
+  Namespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub "${ProjectName}-ns"
+      DbName: dev
+      AdminUsername: admin
+      AdminUserPassword: !Ref AdminPassword
+      IamRoles: [!GetAtt RedshiftRole.Arn]
+      DefaultIamRoleArn: !GetAtt RedshiftRole.Arn
+
+  Workgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    DependsOn: Namespace
+    Properties:
+      WorkgroupName: !Sub "${ProjectName}-wg"
+      NamespaceName: !Sub "${ProjectName}-ns"
+      BaseCapacity: !Ref BaseCapacity
+      SubnetIds: !Ref SubnetIds
+      # The Data API reaches the workgroup over a regional HTTPS endpoint,
+      # so nothing needs to be publicly accessible.
+      PubliclyAccessible: false
+
+Outputs:
+  S3Bucket:
+    Value: !Ref DataBucket
+  RedshiftIamRole:
+    Value: !GetAtt RedshiftRole.Arn
+  RedshiftWorkgroup:
+    Value: !Sub "${ProjectName}-wg"
+  RedshiftDatabase:
+    Value: dev
+  ApiAccessPolicyArn:
+    Value: !Ref ApiAccessPolicy
+    Description: Attach to the Elastic Beanstalk instance role before Stage 5.
