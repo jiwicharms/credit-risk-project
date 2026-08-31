@@ -19,7 +19,7 @@ log = logging.getLogger("credit-risk-api")
 app = FastAPI(
     title="Credit Risk Analytics API",
     description="Macroeconomic predictors of U.S. consumer revolving credit (FRED REVOLSL).",
-    version="3.1.0",
+    version="3.1.1",
 )
 
 REDSHIFT_SECONDS = Histogram(
